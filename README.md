@@ -1,18 +1,40 @@
-# PlanVer Leaderboard
-This repository hosts the leaderboard for the [PlanVer green agent](https://github.com/ElliotGestrin/planver-green-agent). View the leaderboard on agentbeats.
+# PlanVer submission runner
 
-The PlanVer agent provides task planning problems in natural language to competing purple agents, which respond with plans in symbolic form. The PlanVer agent evaluates the plans and scores the purple agents based on their performance.
+This public fork is prepared for a reproducible submission by
+[`onejumpinc/planver-classical-agent`](https://github.com/onejumpinc/planver-classical-agent).
+It does not run on pushes. The workflow is manual-only and intentionally remains
+non-runnable until the participant has a real AgentBeats UUID.
 
-For further details on the PlanVer green agent, please refer to [its repository](https://github.com/ElliotGestrin/planver-green-agent).
+The participant release passed the exact 12-task leaderboard configuration and
+all 120 published tasks across Barman, Blocks World, Childsnack, and Gripper in
+[`Run 35544219235`](https://github.com/onejumpinc/planver-classical-agent/actions/runs/35544219235).
+The exact public image is:
 
-## Scoring
-Agents are scores based on the number of problems they solve correctly, with no concern for time taken or plan length. An agent's score is the percentage of problems it solves correctly out of the total number of problems it attempts.
+```text
+ghcr.io/onejumpinc/planver-classical-agent@sha256:85e91909f1aaa2f58aaa97f7108430dd4bcbbdd9b9eaf263ae83d3481392317e
+```
 
-Further details can also be found, such as how many tasks of which difficulties are solved per domain, though this is not the basis for the leaderboard ranking.
+This release validation is not represented as an official AgentBeats score.
+Only a completed green-agent run can produce a leaderboard submission.
 
-## Parameters
-The PlanVer green agent can be configured to provide problems from a selection of domains and difficulties. For the list of supported domains, see the [PlanVer green agent repository](https://github.com/ElliotGestrin/planver-green-agent/tree/main/pddl). The maximum number of problems per difficulty level is 10 and, even within a difficulty, higher numbered problems are generally more challenging.
+## Benchmark and exact gate
 
-## Requirements for participant agents
-Your A2A agents must respond to natural language requests. The only response generated should be a valid PDDL plan. No additional text or formatting should be included in the response. This is detailed in the request from the PlanVer green agent.
+The pinned scenario selects one easy, medium, and hard problem from each of the
+four domains, for 12 tasks total. The green agent validates each symbolic PDDL
+plan with `pddlval`. The workflow creates a submission branch only when all 12
+plans are valid, all domain and difficulty aggregates are exact, the reported
+success rate is exactly 1.0, all three container images match immutable digests,
+and GitHub Actions provenance matches the running workflow.
 
+Any missing prerequisite, registration mismatch, topology drift, partial result,
+invalid plan, error, non-finite value, mutable image, or provenance mismatch
+stops the workflow before a submission branch is created.
+
+## Remaining prerequisites
+
+1. Register the participant on AgentBeats with this immutable manifest:
+   `https://raw.githubusercontent.com/onejumpinc/planver-classical-agent/92346c4520896095c58486b0fd5ac28b776fdb08/amber-manifest.json5`.
+2. Replace `PLANVER_AGENT_ID` in both `scenario.toml` and the workflow with the
+   returned lowercase UUID.
+3. Manually dispatch **Run Scenario**. If and only if the exact 12/12 gate passes,
+   use the generated comparison link to open the upstream pull request.

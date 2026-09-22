@@ -3,7 +3,7 @@ agentbeats_id = "019bc406-77f9-7a13-9fa6-ea6987e19db3"
 env = { }
 
 [[participants]]
-agentbeats_id = ""
+agentbeats_id = "PLANVER_AGENT_ID"
 name = "planner"
 env = {}
 

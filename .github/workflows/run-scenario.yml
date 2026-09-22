@@ -22,36 +22,45 @@ jobs:
       PLANVER_AGENT_ID: 'PLANVER_AGENT_ID'
       GREEN_IMAGE: ghcr.io/elliotgestrin/planver-green-agent@sha256:0bdadb2617ddd591542bff64dc69573e20c83fa0cd1ae308f164a6785a7afc5b
       PLANNER_IMAGE: ghcr.io/onejumpinc/planver-classical-agent@sha256:85e91909f1aaa2f58aaa97f7108430dd4bcbbdd9b9eaf263ae83d3481392317e
+      PARTICIPANT_MANIFEST_URL: https://raw.githubusercontent.com/onejumpinc/planver-classical-agent/92346c4520896095c58486b0fd5ac28b776fdb08/amber-manifest.json5
+      PARTICIPANT_MANIFEST_SHA256: 4682e6de8f5470a6774479150240eb57ad6190f51f84399d35cf9c1bbd0224cf
       CLIENT_IMAGE: ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install tomli tomli-w pyyaml requests
+        run: pip install tomli-w==1.2.0 pyyaml==6.0.3 requests==2.34.2
 
       - name: Verify exact scenario
         run: |
           test ! -e .env
+          test ! -e .env.example
           python - <<'PY'
           import json
           import os
           import re
+          import requests
           import sys
           import tomllib
+
+          def fail(message):
+              sys.exit(f"Gate failed: {message}")
 
           agent_id = os.environ["PLANVER_AGENT_ID"]
           if not re.fullmatch(
               r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
               agent_id,
           ):
-              sys.exit(f"PLANVER_AGENT_ID is not a lowercase UUID: {agent_id!r}")
+              fail(f"PLANVER_AGENT_ID is not a lowercase UUID: {agent_id!r}")
 
           with open("scenario.toml", "rb") as scenario_file:
               scenario = tomllib.load(scenario_file)
@@ -72,22 +81,86 @@ jobs:
               },
           }
           if json.dumps(scenario, sort_keys=True) != json.dumps(expected, sort_keys=True):
-              sys.exit(f"scenario.toml mismatch:\n{scenario!r}")
-          print("Exact 12-task scenario verified")
+              fail(f"scenario.toml mismatch:\n{scenario!r}")
+
+          response = requests.get(
+              f"https://agentbeats.dev/api/agents/{agent_id}",
+              headers={
+                  "User-Agent": (
+                      "planver-leaderboard/1.0 "
+                      "(+https://github.com/onejumpinc/planver-leaderboard)"
+                  )
+              },
+              timeout=30,
+          )
+          response.raise_for_status()
+          registered = response.json()
+          if registered.get("id") != agent_id:
+              fail(f"registration id={registered.get('id')!r}")
+          if registered.get("creator_name") != "onejumpinc":
+              fail(f"registration creator={registered.get('creator_name')!r}")
+          if registered.get("color") != "purple":
+              fail(f"registration color={registered.get('color')!r}")
+          locator = (
+              registered.get("docker_image"),
+              registered.get("amber_manifest_url"),
+          )
+          allowed = {
+              (os.environ["PLANNER_IMAGE"], None),
+              (None, os.environ["PARTICIPANT_MANIFEST_URL"]),
+              (
+                  os.environ["PLANNER_IMAGE"],
+                  os.environ["PARTICIPANT_MANIFEST_URL"],
+              ),
+          }
+          if locator not in allowed:
+              fail(f"unexpected registration locator={locator!r}")
+          print("Exact 12-task scenario and registration verified")
           PY
 
+          manifest_path="$RUNNER_TEMP/planver-participant-manifest.json5"
+          curl --fail --silent --show-error --location \
+            --output "$manifest_path" "$PARTICIPANT_MANIFEST_URL"
+          printf '%s  %s\n' "$PARTICIPANT_MANIFEST_SHA256" "$manifest_path" \
+            | sha256sum --check --strict
+
       - name: Generate docker-compose.yml
-        run: python generate_compose.py --scenario scenario.toml
+        run: |
+          python generate_compose.py --scenario scenario.toml
+          test ! -e .env
+          test ! -e .env.example
 
       - name: Pin and verify exact images
         run: |
           python - <<'PY'
           import os
           import sys
+          import tomllib
           import yaml
 
           with open("docker-compose.yml") as compose_file:
               compose = yaml.safe_load(compose_file)
+          with open("a2a-scenario.toml", "rb") as scenario_file:
+              a2a_scenario = tomllib.load(scenario_file)
+
+          expected_a2a = {
+              "green_agent": {"endpoint": "http://green-agent:9009"},
+              "participants": [
+                  {
+                      "role": "planner",
+                      "endpoint": "http://planner:9009",
+                      "agentbeats_id": os.environ["PLANVER_AGENT_ID"],
+                  }
+              ],
+              "config": {
+                  "domains": ["barman", "blocksworld", "childsnack", "gripper"],
+                  "easy_count": 1,
+                  "medium_count": 1,
+                  "hard_count": 1,
+              },
+          }
+          if a2a_scenario != expected_a2a:
+              sys.exit(f"Unexpected a2a-scenario.toml: {a2a_scenario!r}")
 
           expected_without_images = {
               "green-agent": {
@@ -175,30 +248,36 @@ jobs:
                       f"{actual_without_image!r}"
                   )
 
-          expected_unpinned_images = {
-              "green-agent": "ghcr.io/elliotgestrin/planver-green-agent:latest",
-              "planner": os.environ["PLANNER_IMAGE"],
-              "agentbeats-client": "ghcr.io/agentbeats/agentbeats-client:v1.0.0",
-          }
           actual_unpinned_images = {
-              name: service["image"]
+              name: service.get("image")
               for name, service in compose["services"].items()
           }
-          if actual_unpinned_images != expected_unpinned_images:
+          if actual_unpinned_images["green-agent"] != (
+              "ghcr.io/elliotgestrin/planver-green-agent:latest"
+          ):
               sys.exit(
-                  "Unexpected API/generated image references: "
-                  f"{actual_unpinned_images!r}"
+                  "Unexpected green API image: "
+                  f"{actual_unpinned_images['green-agent']!r}"
               )
-
-          registered_image = compose["services"]["planner"]["image"]
-          expected_image = os.environ["PLANNER_IMAGE"]
-          if registered_image != expected_image:
+          if actual_unpinned_images["agentbeats-client"] != (
+              "ghcr.io/agentbeats/agentbeats-client:v1.0.0"
+          ):
               sys.exit(
-                  "PlanVer registration resolved to "
-                  f"{registered_image!r}, expected {expected_image!r}"
+                  "Unexpected client image: "
+                  f"{actual_unpinned_images['agentbeats-client']!r}"
+              )
+          if actual_unpinned_images["planner"] not in {
+              os.environ["PLANNER_IMAGE"],
+              "None",
+              None,
+          }:
+              sys.exit(
+                  "Unexpected planner API image: "
+                  f"{actual_unpinned_images['planner']!r}"
               )
 
           compose["services"]["green-agent"]["image"] = os.environ["GREEN_IMAGE"]
+          compose["services"]["planner"]["image"] = os.environ["PLANNER_IMAGE"]
           compose["services"]["agentbeats-client"]["image"] = os.environ[
               "CLIENT_IMAGE"
           ]
@@ -243,93 +322,150 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import re
           import sys
 
           def fail(message):
               sys.exit(f"Gate failed: {message}")
 
-          def number_equals(actual, expected):
-              return (
-                  type(actual) in (int, float)
-                  and type(expected) in (int, float)
-                  and actual == expected
+          with open("output/results.json") as results_file:
+              results = json.load(
+                  results_file,
+                  parse_constant=lambda value: fail(
+                      f"non-finite result number {value}"
+                  ),
               )
 
-          with open("output/results.json") as results_file:
-              results = json.load(results_file)
-
+          if not isinstance(results, dict) or set(results) != {
+              "participants", "results"
+          }:
+              fail(f"unexpected result document={results!r}")
           expected_participants = {"planner": os.environ["PLANVER_AGENT_ID"]}
-          if results.get("participants") != expected_participants:
-              fail(f"participants={results.get('participants')!r}")
+          if results["participants"] != expected_participants:
+              fail(f"participants={results['participants']!r}")
 
-          runs = results.get("results")
+          runs = results["results"]
           if not isinstance(runs, list) or len(runs) != 1:
               fail("expected exactly one result")
           result = runs[0]
+          if not isinstance(result, dict) or set(result) != {
+              "total_tasks", "total_valid", "total_invalid", "total_errors",
+              "overall_success_rate", "domain_results",
+          }:
+              fail(f"unexpected benchmark result={result!r}")
 
           for key, expected in (
               ("total_tasks", 12),
               ("total_valid", 12),
               ("total_invalid", 0),
               ("total_errors", 0),
-              ("overall_success_rate", 1),
           ):
-              if not number_equals(result.get(key), expected):
-                  fail(f"{key}={result.get(key)!r}, expected {expected}")
+              if type(result[key]) is not int or result[key] != expected:
+                  fail(f"{key}={result[key]!r}, expected {expected}")
+          if type(result["overall_success_rate"]) is not float or (
+              result["overall_success_rate"] != 1.0
+          ):
+              fail(
+                  f"overall_success_rate={result['overall_success_rate']!r}, "
+                  "expected 1.0"
+              )
 
-          domains = result.get("domain_results")
-          names = (
-              [domain.get("domain") for domain in domains]
-              if isinstance(domains, list)
-              else None
-          )
+          domains = result["domain_results"]
           expected_names = ["barman", "blocksworld", "childsnack", "gripper"]
-          if names is None or sorted(names) != expected_names:
+          if not isinstance(domains, list) or len(domains) != 4:
+              fail(f"domain_results={domains!r}")
+          names = [
+              domain.get("domain") if isinstance(domain, dict) else None
+              for domain in domains
+          ]
+          if names != expected_names:
               fail(f"domains={names!r}")
 
           for domain in domains:
               name = domain["domain"]
+              if set(domain) != {
+                  "domain", "total_tasks", "valid_plans", "invalid_plans",
+                  "errors", "success_rate", "results_by_difficulty",
+              }:
+                  fail(f"unexpected {name} result={domain!r}")
               for key, expected in (
                   ("total_tasks", 3),
                   ("valid_plans", 3),
                   ("invalid_plans", 0),
                   ("errors", 0),
-                  ("success_rate", 1),
               ):
-                  if not number_equals(domain.get(key), expected):
-                      fail(f"{name}.{key}={domain.get(key)!r}, expected {expected}")
+                  if type(domain[key]) is not int or domain[key] != expected:
+                      fail(f"{name}.{key}={domain[key]!r}, expected {expected}")
+              if type(domain["success_rate"]) is not float or (
+                  domain["success_rate"] != 1.0
+              ):
+                  fail(f"{name}.success_rate={domain['success_rate']!r}")
 
-              difficulties = domain.get("results_by_difficulty")
+              difficulties = domain["results_by_difficulty"]
               if (
                   not isinstance(difficulties, dict)
-                  or sorted(difficulties) != ["easy", "hard", "medium"]
+                  or list(difficulties) != ["easy", "medium", "hard"]
               ):
                   fail(f"{name}.results_by_difficulty={difficulties!r}")
               for difficulty, values in difficulties.items():
+                  if not isinstance(values, dict) or set(values) != {
+                      "total", "valid", "invalid", "errors"
+                  }:
+                      fail(f"unexpected {name}.{difficulty}={values!r}")
                   for key, expected in (
                       ("total", 1),
                       ("valid", 1),
                       ("invalid", 0),
                       ("errors", 0),
                   ):
-                      if not number_equals(values.get(key), expected):
+                      if type(values[key]) is not int or values[key] != expected:
                           fail(
-                              f"{name}.{difficulty}.{key}={values.get(key)!r}, "
+                              f"{name}.{difficulty}.{key}={values[key]!r}, "
                               f"expected {expected}"
                           )
 
           with open("output/provenance.json") as provenance_file:
-              provenance = json.load(provenance_file)
+              provenance = json.load(
+                  provenance_file,
+                  parse_constant=lambda value: fail(
+                      f"non-finite provenance number {value}"
+                  ),
+              )
+          if not isinstance(provenance, dict) or set(provenance) != {
+              "image_digests", "timestamp", "github_actions"
+          }:
+              fail(f"unexpected provenance={provenance!r}")
+          if not isinstance(provenance["timestamp"], str) or not re.fullmatch(
+              r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+              provenance["timestamp"],
+          ):
+              fail(f"invalid timestamp={provenance['timestamp']!r}")
           expected_digests = {
               "green-agent": os.environ["GREEN_IMAGE"],
               "planner": os.environ["PLANNER_IMAGE"],
               "agentbeats-client": os.environ["CLIENT_IMAGE"],
           }
-          if provenance.get("image_digests") != expected_digests:
-              fail(
-                  "provenance image_digests="
-                  f"{provenance.get('image_digests')!r}"
-              )
+          if provenance["image_digests"] != expected_digests:
+              fail(f"image_digests={provenance['image_digests']!r}")
+          expected_actions = {
+              "run_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              ),
+              "run_logs_url": (
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}/logs"
+              ),
+              "ref": os.environ["GITHUB_REF"],
+              "sha": os.environ["GITHUB_SHA"],
+              "repository_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+              ),
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+          }
+          if provenance["github_actions"] != expected_actions:
+              fail(f"github_actions={provenance['github_actions']!r}")
 
           print("Exact 12/12 score and immutable provenance verified")
           PY
@@ -368,6 +504,11 @@ jobs:
           git checkout -b "${{ steps.metadata.outputs.branch_name }}" upstream/main
 
       - name: Commit results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: '!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -385,9 +526,7 @@ jobs:
         run: |
           {
             echo "### Submit your results"
-            echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)"
-            echo ""
-            echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets."
+            echo "[Open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
